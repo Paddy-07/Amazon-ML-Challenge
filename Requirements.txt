@@ -1,0 +1,9 @@
+pandas
+pyarrow
+scikit-learn
+scipy
+rapidfuzz
+joblib
+lightgbm
+xgboost
+indic_transliteration
