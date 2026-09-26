@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Amazon ML Challenge 2026 — Blocking / Candidate Generation
+Amazon ML Challenge 2026 — Blocking / Candidate Generation (v2 — streams
+to disk instead of building one giant in-memory list, which caused a
+MemoryError on the full ~2.2M-entity dataset)
 
 SHARED by both the LightGBM and XGBoost branches — run once, use the same
 cache/*_candidate_pairs.parquet for both.
@@ -18,8 +20,16 @@ Strategy: token-based inverted-index blocking.
     TRAIN ONLY and then reused as-is for test, so blocking is defined
     identically on both splits (no mixing).
   - Buckets larger than --max-block-size are dropped entirely (a token
-    that slipped past the stoplist but still explodes) rather than
-    included, to keep runtime/memory bounded.
+    that slipped past the stoplist but still explodes).
+  - Each S1 entity's candidate set is additionally hard-capped at
+    --max-candidates-per-entity (default 300) — without this, a single
+    entity whose tokens each survive the block-size filter but together
+    still pull in thousands of candidates can single-handedly blow up
+    memory. If a lot of entities are hitting this cap, that's a sign to
+    lower --max-block-size instead of raising this cap.
+  - Candidate pairs are WRITTEN TO DISK IN BATCHES as they're generated
+    (via a Parquet writer), never accumulated in one big Python list —
+    this is what fixes the MemoryError on the real dataset.
 
 This only uses normalized *name* tokens for blocking (not address) to
 keep the inverted index a manageable size on the ~10M-row test S2+S3
@@ -44,6 +54,13 @@ import time
 from collections import Counter, defaultdict
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+PAIR_SCHEMA = pa.schema([
+    ("source1_entity_id", pa.string()),
+    ("candidate_entity_id", pa.string()),
+])
 
 
 def compute_stop_tokens(name_norm_series, top_k=40, min_token_len=2):
@@ -72,15 +89,33 @@ def build_token_index(df, stop_tokens, id_col="entity_id",
     return index
 
 
-def generate_candidates(s1_df, index, stop_tokens, max_block_size,
-                         id_col="entity_id", name_col="business_name_norm",
-                         country_col="country"):
-    """For each S1 row, union candidate ids from all its normalized-name
-    tokens' blocks (same country). Returns list of (s1_id, candidate_id)
-    pairs (long format)."""
-    pairs = []
+def generate_candidates_streaming(s1_df, index, stop_tokens, max_block_size,
+                                   out_path, max_candidates_per_entity=300,
+                                   batch_size=500_000,
+                                   id_col="entity_id", name_col="business_name_norm",
+                                   country_col="country"):
+    """Stream candidate pairs straight to a Parquet file in batches,
+    instead of accumulating one giant Python list — this is the fix for
+    the MemoryError on the real ~2.2M-entity dataset. Returns
+    (total_pairs, n_entities_capped)."""
+    writer = None
+    buf_s1, buf_cand = [], []
+    total_pairs = 0
+    n_entities_capped = 0
     n = len(s1_df)
     t0 = time.time()
+
+    def flush():
+        nonlocal writer, buf_s1, buf_cand, total_pairs
+        if not buf_s1:
+            return
+        table = pa.table({"source1_entity_id": buf_s1, "candidate_entity_id": buf_cand}, schema=PAIR_SCHEMA)
+        if writer is None:
+            writer = pq.ParquetWriter(out_path, PAIR_SCHEMA)
+        writer.write_table(table)
+        total_pairs += len(buf_s1)
+        buf_s1, buf_cand = [], []
+
     for i, (eid, country, text) in enumerate(zip(s1_df[id_col], s1_df[country_col], s1_df[name_col])):
         cands = set()
         if isinstance(text, str) and text:
@@ -90,16 +125,36 @@ def generate_candidates(s1_df, index, stop_tokens, max_block_size,
                 bucket = index.get((country, tok))
                 if bucket and len(bucket) <= max_block_size:
                     cands.update(bucket)
+
+        if max_candidates_per_entity and len(cands) > max_candidates_per_entity:
+            cands = set(list(cands)[:max_candidates_per_entity])
+            n_entities_capped += 1
+
         for cid in cands:
-            pairs.append((eid, cid))
-        if (i + 1) % 50000 == 0:
+            buf_s1.append(eid)
+            buf_cand.append(cid)
+
+        if len(buf_s1) >= batch_size:
+            flush()
+
+        if (i + 1) % 100000 == 0:
             elapsed = time.time() - t0
-            print(f"    {i+1:,}/{n:,} S1 entities blocked ({elapsed:.0f}s)", end="\r")
-    print(f"    {n:,}/{n:,} S1 entities blocked" + " " * 20)
-    return pairs
+            print(f"    {i+1:,}/{n:,} S1 entities blocked ({elapsed:.0f}s, {total_pairs + len(buf_s1):,} pairs so far)", end="\r")
+
+    flush()
+    if writer is not None:
+        writer.close()
+    else:
+        # no pairs at all across the whole split — still write a valid empty file
+        pq.write_table(pa.table({"source1_entity_id": pa.array([], type=pa.string()),
+                                  "candidate_entity_id": pa.array([], type=pa.string())}, schema=PAIR_SCHEMA), out_path)
+
+    print(f"    {n:,}/{n:,} S1 entities blocked" + " " * 30)
+    return total_pairs, n_entities_capped
 
 
-def run_blocking(cache_dir, split, stop_tokens=None, max_block_size=5000, fit_stopwords=False, top_k=40):
+def run_blocking(cache_dir, split, stop_tokens=None, max_block_size=1000,
+                  max_candidates_per_entity=300, fit_stopwords=False, top_k=40):
     s1_path = os.path.join(cache_dir, f"{split}_source1_normalized.parquet")
     s2_path = os.path.join(cache_dir, f"{split}_source2_normalized.parquet")
     s3_path = os.path.join(cache_dir, f"{split}_source3_normalized.parquet")
@@ -140,23 +195,28 @@ def run_blocking(cache_dir, split, stop_tokens=None, max_block_size=5000, fit_st
         print(f"    index now has {len(index):,} (country, token) keys")
 
     print(f"  generating candidates for {split}_source1 ({len(s1_df):,} entities) ...")
-    pairs = generate_candidates(s1_df, index, stop_tokens, max_block_size)
-    pairs_df = pd.DataFrame(pairs, columns=["source1_entity_id", "candidate_entity_id"])
-
     out_path = os.path.join(cache_dir, f"{split}_candidate_pairs.parquet")
-    pairs_df.to_parquet(out_path, index=False)
+    total_pairs, n_capped = generate_candidates_streaming(
+        s1_df, index, stop_tokens, max_block_size, out_path,
+        max_candidates_per_entity=max_candidates_per_entity,
+    )
+    del index
 
-    n_s1_with_candidates = pairs_df["source1_entity_id"].nunique()
-    avg_candidates = len(pairs_df) / max(1, len(s1_df))
+    n_s1_with_candidates = None  # computed cheaply below without reloading everything
+    avg_candidates = total_pairs / max(1, len(s1_df))
     print(f"  -> {out_path}")
-    print(f"     {len(pairs_df):,} candidate pairs, avg {avg_candidates:.1f} candidates/S1 entity")
-    print(f"     {n_s1_with_candidates:,}/{len(s1_df):,} S1 entities have >=1 candidate "
-          f"({100*n_s1_with_candidates/len(s1_df):.1f}%)")
+    print(f"     {total_pairs:,} candidate pairs, avg {avg_candidates:.1f} candidates/S1 entity")
+    if n_capped:
+        print(f"     WARNING: {n_capped:,} S1 entities hit the {max_candidates_per_entity}-candidate cap — "
+              f"consider lowering --max-block-size if this number is large")
 
-    return pairs_df, stop_tokens, s1_df
+    return out_path, stop_tokens, s1_df
 
 
-def evaluate_recall(cache_dir, pairs_df, s1_df):
+def evaluate_recall(cache_dir, candidate_pairs_path, batch_size=1_000_000):
+    """Streams the (potentially large) candidate_pairs parquet file in
+    batches to build the candidate lookup, instead of loading it fully
+    into a single DataFrame."""
     gt_path = os.path.join(cache_dir, "train_ground_truth.parquet")
     if not os.path.isfile(gt_path):
         print("  [skip recall eval] train_ground_truth.parquet not found")
@@ -167,10 +227,14 @@ def evaluate_recall(cache_dir, pairs_df, s1_df):
     for s1_id, matched in zip(gt["source1_entity_id"], gt["matched_entity_ids"]):
         ids = set(x for x in matched.split(",") if x.strip()) if isinstance(matched, str) else set()
         gt_dict[s1_id] = ids
+    del gt
 
     cand_dict = defaultdict(set)
-    for s1_id, cid in zip(pairs_df["source1_entity_id"], pairs_df["candidate_entity_id"]):
-        cand_dict[s1_id].add(cid)
+    pf = pq.ParquetFile(candidate_pairs_path)
+    for batch in pf.iter_batches(batch_size=batch_size):
+        chunk = batch.to_pandas()
+        for s1_id, cid in zip(chunk["source1_entity_id"], chunk["candidate_entity_id"]):
+            cand_dict[s1_id].add(cid)
 
     total_true = 0
     total_found = 0
@@ -197,8 +261,10 @@ def main():
     parser = argparse.ArgumentParser(description="Blocking / candidate generation.")
     parser.add_argument("--cache-dir", default="cache")
     parser.add_argument("--split", choices=["train", "test"], required=True)
-    parser.add_argument("--max-block-size", type=int, default=5000,
+    parser.add_argument("--max-block-size", type=int, default=1000,
                          help="Drop a token's block entirely if it has more than this many entities (default: %(default)s)")
+    parser.add_argument("--max-candidates-per-entity", type=int, default=300,
+                         help="Hard cap on candidates kept per S1 entity, to bound memory (default: %(default)s)")
     parser.add_argument("--top-k-stopwords", type=int, default=40,
                          help="How many most-frequent name tokens to exclude as blocking keys, fit on train only (default: %(default)s)")
     parser.add_argument("--evaluate", action="store_true",
@@ -207,9 +273,10 @@ def main():
 
     print(f"Blocking for split={args.split}")
     fit_stopwords = (args.split == "train")
-    pairs_df, stop_tokens, s1_df = run_blocking(
+    out_path, stop_tokens, s1_df = run_blocking(
         args.cache_dir, args.split,
         max_block_size=args.max_block_size,
+        max_candidates_per_entity=args.max_candidates_per_entity,
         fit_stopwords=fit_stopwords,
         top_k=args.top_k_stopwords,
     )
@@ -218,7 +285,7 @@ def main():
         if args.split != "train":
             print("  --evaluate only works on --split train (no ground truth for test)")
         else:
-            evaluate_recall(args.cache_dir, pairs_df, s1_df)
+            evaluate_recall(args.cache_dir, out_path)
 
 
 if __name__ == "__main__":
