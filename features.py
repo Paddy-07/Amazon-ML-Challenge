@@ -1,257 +1,322 @@
 #!/usr/bin/env python3
 """
-Amazon ML Challenge 2026 — Feature Engineering
+Amazon ML Challenge 2026 — Blocking / Candidate Generation (v3)
 
-SHARED by both the LightGBM and XGBoost branches. Run once per split, use
-the same cache/{split}_features.parquet for both model scripts.
+Changes from v2, based on diagnostics run against the real dataset:
+  - v2's --max-candidates-per-entity truncated an unordered Python set
+    ARBITRARILY, discarding real matches at the same rate as noise
+    (confirmed: 55.3% of true matches that DID share a token were lost
+    this way on the real data). v3 tracks a token-hit COUNT per candidate
+    (how many name/address tokens it shares with the S1 entity) and,
+    when truncating, keeps the highest-hit-count candidates first — a
+    true match usually shares several tokens; a coincidental block-mate
+    usually shares exactly one.
+  - Added ADDRESS-token blocking as a second signal, unioned with name-
+    token blocking (diagnostic showed ~14.5% of true matches have zero
+    shared name token but DO share an address token).
+  - Separate stoplists for name tokens vs address tokens (address text
+    has its own generic filler words — "road", "street", "near", "floor",
+    "no", "house" — different from name filler words like "llc"/
+    "private"/"limited"). Both fit on TRAIN ONLY, reused as-is for test.
+  - Raised default --max-block-size and --max-candidates-per-entity now
+    that stopword filtering is doing more of the real work of excluding
+    generic tokens (the block-size cap should only be catching genuine
+    outliers now, not doing the bulk of the filtering).
 
-Features computed per (S1, candidate) pair, on the NORMALIZED name/address
-text produced by normalize.py:
-  - name_token_jaccard, addr_token_jaccard      (order-invariant overlap)
-  - name_fuzz_ratio, name_fuzz_token_sort_ratio  (rapidfuzz, char-level +
-    word-order-invariant — token_sort_ratio specifically targets the
-    "United Bny Clinic" vs "United Clinic Bny" word-reordering pattern)
-  - addr_fuzz_ratio, addr_fuzz_token_sort_ratio
-  - name_chargram_tfidf_cosine, addr_chargram_tfidf_cosine
-    (character n-gram TF-IDF cosine — the backup signal for domain-blob
-    names like "teamsterslocal425.com" that word-level tokenizing can't
-    match, and partial credit for romanized-but-imperfect Indic names)
-  - name_len_diff, addr_len_diff                 (normalized text length
-    difference, a weak but free signal)
-  - addr_missing_s1, addr_missing_cand           (explicit flags — do NOT
-    let a missing address silently look like "0% similar"; several real
-    true-match pairs in the sample data had a missing address on one side)
+Strategy recap:
+  - Hard filter: country must match exactly.
+  - Build inverted indices (country, token) -> [entity_ids] separately
+    for name tokens and address tokens, over S2+S3.
+  - For each S1 entity, union candidates from every name/address token it
+    shares with an S2/S3 record (same country), tracking a hit-count per
+    candidate.
+  - Buckets larger than --max-block-size are dropped (still needed as a
+    backstop against pathological tokens that slip past the stoplist).
+  - If an entity's total candidate count exceeds
+    --max-candidates-per-entity, keep the highest-hit-count candidates.
+  - Candidate pairs stream to disk in batches (memory-safe on the full
+    dataset — this was already fixed in v2).
 
-The TF-IDF vectorizer is FIT ON TRAIN ONLY (names+addresses from
-train_source1/2/3) and saved to cache/tfidf_name.pkl / tfidf_addr.pkl —
-the test-split run loads and reuses those exact same fitted vectorizers
-rather than re-fitting on test text. This keeps the two splits' feature
-definitions identical (the same "avoid mixing" principle as the blocking
-stoplist).
+Usage (run from student_resource/, after preprocess_dataset.py):
 
-Usage (run from student_resource/, after blocking.py):
+    python3 blocking.py --cache-dir cache --split train --evaluate
+    python3 blocking.py --cache-dir cache --split test
 
-    python3 features.py --cache-dir cache --split train
-    python3 features.py --cache-dir cache --split test
-
-Requires: pandas, pyarrow, scikit-learn, rapidfuzz, scipy, joblib
+Requires: pandas, pyarrow
 """
 
 import argparse
 import os
+import pickle
 import sys
 import time
+from collections import Counter, defaultdict
 
-import joblib
-import numpy as np
 import pandas as pd
-from rapidfuzz import fuzz
-from scipy import sparse
-from sklearn.feature_extraction.text import TfidfVectorizer
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+PAIR_SCHEMA = pa.schema([
+    ("source1_entity_id", pa.string()),
+    ("candidate_entity_id", pa.string()),
+])
 
 
-def _jaccard(a, b):
-    if not a or not b:
-        return 0.0
-    sa, sb = set(a.split()), set(b.split())
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
+def compute_stop_tokens(text_series, top_k, min_token_len=2):
+    counter = Counter()
+    for text in text_series:
+        if isinstance(text, str) and text:
+            counter.update(set(text.split()))
+    return {tok for tok, _ in counter.most_common(top_k) if len(tok) >= min_token_len}
 
 
-def load_source_lookup(cache_dir, split, source_num):
-    path = os.path.join(cache_dir, f"{split}_source{source_num}_normalized.parquet")
-    df = pd.read_parquet(
-        path,
-        columns=["entity_id", "business_name", "business_address",
-                 "business_name_norm", "business_address_norm"],
-    )
-    df["business_name_norm"] = df["business_name_norm"].fillna("")
-    df["business_address_norm"] = df["business_address_norm"].fillna("")
-    return df
+def build_token_index(df, stop_tokens, text_col, id_col="entity_id", country_col="country"):
+    """Return dict: (country, token) -> list[entity_id]."""
+    index = defaultdict(list)
+    for eid, country, text in zip(df[id_col], df[country_col], df[text_col]):
+        if not isinstance(text, str) or not text:
+            continue
+        for tok in set(text.split()):
+            if tok in stop_tokens or len(tok) < 2:
+                continue
+            index[(country, tok)].append(eid)
+    return index
 
 
-def attach_candidate_fields(pairs_df, s2_df, s3_df):
-    """Attach candidate-side (business_name_norm, business_address_norm,
-    raw fields) by splitting on ID prefix and merging with the right
-    source table — vectorized pandas merges, no per-row Python dict
-    lookups (important at multi-million-row scale)."""
-    is_s2 = pairs_df["candidate_entity_id"].str.startswith("S2-")
+def generate_candidates_streaming(s1_df, name_index, addr_index, name_stop, addr_stop,
+                                   max_block_size, out_path, max_candidates_per_entity,
+                                   batch_size=500_000,
+                                   id_col="entity_id", name_col="business_name_norm",
+                                   addr_col="business_address_norm", country_col="country"):
+    """Stream candidate pairs to Parquet in batches. For each S1 entity,
+    tracks a Counter of candidate_id -> hit_count (how many name/address
+    tokens matched), and keeps the highest-hit-count candidates when the
+    total exceeds max_candidates_per_entity — instead of an arbitrary cut."""
+    writer = None
+    buf_s1, buf_cand = [], []
+    total_pairs = 0
+    n_entities_capped = 0
+    n = len(s1_df)
+    t0 = time.time()
 
-    s2_part = pairs_df[is_s2].merge(
-        s2_df, left_on="candidate_entity_id", right_on="entity_id", how="left"
-    )
-    s3_part = pairs_df[~is_s2].merge(
-        s3_df, left_on="candidate_entity_id", right_on="entity_id", how="left"
-    )
-    out = pd.concat([s2_part, s3_part], ignore_index=True)
-    out = out.rename(columns={
-        "business_name": "cand_name_raw",
-        "business_address": "cand_addr_raw",
-        "business_name_norm": "cand_name_norm",
-        "business_address_norm": "cand_addr_norm",
-    })
-    out = out.drop(columns=["entity_id"])
-    return out
+    def flush():
+        nonlocal writer, buf_s1, buf_cand, total_pairs
+        if not buf_s1:
+            return
+        table = pa.table({"source1_entity_id": buf_s1, "candidate_entity_id": buf_cand}, schema=PAIR_SCHEMA)
+        if writer is None:
+            writer = pq.ParquetWriter(out_path, PAIR_SCHEMA)
+        writer.write_table(table)
+        total_pairs += len(buf_s1)
+        buf_s1, buf_cand = [], []
 
+    cols = zip(s1_df[id_col], s1_df[country_col], s1_df[name_col], s1_df[addr_col])
+    for i, (eid, country, name_text, addr_text) in enumerate(cols):
+        hits = Counter()
 
-def attach_s1_fields(pairs_df, s1_df):
-    out = pairs_df.merge(s1_df, left_on="source1_entity_id", right_on="entity_id", how="left")
-    out = out.rename(columns={
-        "business_name": "s1_name_raw",
-        "business_address": "s1_addr_raw",
-        "business_name_norm": "s1_name_norm",
-        "business_address_norm": "s1_addr_norm",
-    })
-    out = out.drop(columns=["entity_id"])
-    return out
+        if isinstance(name_text, str) and name_text:
+            for tok in set(name_text.split()):
+                if tok in name_stop or len(tok) < 2:
+                    continue
+                bucket = name_index.get((country, tok))
+                if bucket and len(bucket) <= max_block_size:
+                    for cid in bucket:
+                        hits[cid] += 1
 
+        if isinstance(addr_text, str) and addr_text:
+            for tok in set(addr_text.split()):
+                if tok in addr_stop or len(tok) < 2:
+                    continue
+                bucket = addr_index.get((country, tok))
+                if bucket and len(bucket) <= max_block_size:
+                    for cid in bucket:
+                        hits[cid] += 1
 
-def fit_or_load_tfidf(cache_dir, split, s1_df, s2_df, s3_df):
-    """Fit char-n-gram TF-IDF vectorizers on TRAIN text only; on test,
-    load and reuse the exact same fitted vectorizers (never refit on test
-    text — keeps feature definitions identical across splits)."""
-    name_path = os.path.join(cache_dir, "tfidf_name.pkl")
-    addr_path = os.path.join(cache_dir, "tfidf_addr.pkl")
+        if max_candidates_per_entity and len(hits) > max_candidates_per_entity:
+            keep = [cid for cid, _ in hits.most_common(max_candidates_per_entity)]
+            n_entities_capped += 1
+        else:
+            keep = list(hits.keys())
 
-    if split == "train":
-        all_names = pd.concat([s1_df["business_name_norm"], s2_df["business_name_norm"], s3_df["business_name_norm"]])
-        all_addrs = pd.concat([s1_df["business_address_norm"], s2_df["business_address_norm"], s3_df["business_address_norm"]])
-        name_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=2, max_features=200000)
-        addr_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=2, max_features=200000)
-        name_vec.fit(all_names[all_names.str.len() > 0])
-        addr_vec.fit(all_addrs[all_addrs.str.len() > 0])
-        joblib.dump(name_vec, name_path)
-        joblib.dump(addr_vec, addr_path)
-        print(f"  fit TF-IDF vectorizers on TRAIN text, saved to {name_path} / {addr_path}")
+        for cid in keep:
+            buf_s1.append(eid)
+            buf_cand.append(cid)
+
+        if len(buf_s1) >= batch_size:
+            flush()
+
+        if (i + 1) % 100000 == 0:
+            elapsed = time.time() - t0
+            print(f"    {i+1:,}/{n:,} S1 entities blocked ({elapsed:.0f}s, {total_pairs + len(buf_s1):,} pairs so far)", end="\r")
+
+    flush()
+    if writer is not None:
+        writer.close()
     else:
-        if not (os.path.isfile(name_path) and os.path.isfile(addr_path)):
+        pq.write_table(pa.table({"source1_entity_id": pa.array([], type=pa.string()),
+                                  "candidate_entity_id": pa.array([], type=pa.string())}, schema=PAIR_SCHEMA), out_path)
+
+    print(f"    {n:,}/{n:,} S1 entities blocked" + " " * 30)
+    return total_pairs, n_entities_capped
+
+
+def run_blocking(cache_dir, split, max_block_size=2500, max_candidates_per_entity=200,
+                  fit_stopwords=False, top_k_name=150, top_k_addr=80):
+    s1_path = os.path.join(cache_dir, f"{split}_source1_normalized.parquet")
+    s2_path = os.path.join(cache_dir, f"{split}_source2_normalized.parquet")
+    s3_path = os.path.join(cache_dir, f"{split}_source3_normalized.parquet")
+
+    s1_df = pd.read_parquet(
+        s1_path, columns=["entity_id", "business_name_norm", "business_address_norm", "country"]
+    )
+    print(f"  loaded {split}_source1: {len(s1_df):,} rows")
+
+    stop_path = os.path.join(cache_dir, "blocking_stopwords.pkl")
+    if fit_stopwords:
+        name_stop = compute_stop_tokens(s1_df["business_name_norm"], top_k=top_k_name)
+        addr_stop = compute_stop_tokens(s1_df["business_address_norm"], top_k=top_k_addr)
+        s2_peek = pd.read_parquet(s2_path, columns=["business_name_norm", "business_address_norm"])
+        name_stop |= compute_stop_tokens(s2_peek["business_name_norm"], top_k=top_k_name)
+        addr_stop |= compute_stop_tokens(s2_peek["business_address_norm"], top_k=top_k_addr)
+        del s2_peek
+        print(f"  fit name stoplist ({len(name_stop)} tokens) on TRAIN only: {sorted(name_stop)[:12]}...")
+        print(f"  fit addr stoplist ({len(addr_stop)} tokens) on TRAIN only: {sorted(addr_stop)[:12]}...")
+        with open(stop_path, "wb") as f:
+            pickle.dump({"name": name_stop, "addr": addr_stop}, f)
+    else:
+        if not os.path.isfile(stop_path):
             raise SystemExit(
-                "No fitted TF-IDF vectorizers found. Run `features.py --split train` "
-                "first — it fits and saves them; test reuses the same ones."
+                "No stoplist found. Run with --split train --evaluate first "
+                "(it fits and saves the shared stoplists), then run --split test."
             )
-        name_vec = joblib.load(name_path)
-        addr_vec = joblib.load(addr_path)
-        print(f"  loaded TF-IDF vectorizers fit on TRAIN, reused as-is for {split}")
+        with open(stop_path, "rb") as f:
+            stops = pickle.load(f)
+        name_stop, addr_stop = stops["name"], stops["addr"]
+        print(f"  loaded shared stoplists (name={len(name_stop)}, addr={len(addr_stop)}) — "
+              f"fit on train, reused as-is for {split}")
 
-    return name_vec, addr_vec
+    name_index, addr_index = {}, {}
+    for src_path, label in [(s2_path, "source2"), (s3_path, "source3")]:
+        print(f"  indexing {split}_{label} ...")
+        df = pd.read_parquet(
+            src_path, columns=["entity_id", "business_name_norm", "business_address_norm", "country"]
+        )
+        n_idx = build_token_index(df, name_stop, "business_name_norm")
+        a_idx = build_token_index(df, addr_stop, "business_address_norm")
+        for k, v in n_idx.items():
+            name_index.setdefault(k, []).extend(v)
+        for k, v in a_idx.items():
+            addr_index.setdefault(k, []).extend(v)
+        del df, n_idx, a_idx
+        print(f"    name index: {len(name_index):,} keys | addr index: {len(addr_index):,} keys")
+
+    print(f"  generating candidates for {split}_source1 ({len(s1_df):,} entities) ...")
+    out_path = os.path.join(cache_dir, f"{split}_candidate_pairs.parquet")
+    total_pairs, n_capped = generate_candidates_streaming(
+        s1_df, name_index, addr_index, name_stop, addr_stop,
+        max_block_size, out_path, max_candidates_per_entity,
+    )
+    del name_index, addr_index
+
+    avg_candidates = total_pairs / max(1, len(s1_df))
+    print(f"  -> {out_path}")
+    print(f"     {total_pairs:,} candidate pairs, avg {avg_candidates:.1f} candidates/S1 entity")
+    if n_capped:
+        print(f"     {n_capped:,} S1 entities hit the {max_candidates_per_entity}-candidate cap "
+              f"(kept their highest-token-overlap candidates, not arbitrary ones)")
+
+    return out_path, s1_df
 
 
-def batched_pairwise_cosine(df, name_col_a, name_col_b, vectorizer, batch_size=200000):
-    """Cosine similarity between two columns of text, row-by-row, computed
-    in batches via sparse TF-IDF transform + row-wise dot product (avoids
-    materializing a full pairwise similarity matrix — only the matching
-    row pairs are needed, not all-vs-all)."""
-    n = len(df)
-    out = np.zeros(n, dtype=np.float32)
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        a_text = df[name_col_a].iloc[start:end].tolist()
-        b_text = df[name_col_b].iloc[start:end].tolist()
-        a_mat = vectorizer.transform(a_text)
-        b_mat = vectorizer.transform(b_text)
-        # row-wise dot product of two equally-shaped sparse matrices
-        dots = np.asarray(a_mat.multiply(b_mat).sum(axis=1)).ravel()
-        a_norm = np.sqrt(np.asarray(a_mat.multiply(a_mat).sum(axis=1)).ravel())
-        b_norm = np.sqrt(np.asarray(b_mat.multiply(b_mat).sum(axis=1)).ravel())
-        denom = a_norm * b_norm
-        denom[denom == 0] = 1.0
-        out[start:end] = dots / denom
-    return out
+def evaluate_recall(cache_dir, candidate_pairs_path, batch_size=2_000_000):
+    """Memory-light recall check: instead of building a dict holding every
+    candidate ID for all 2.2M entities (which is what was running out of
+    memory), this only ever holds the much smaller TRUE-match pairs (a few
+    million rows) plus a per-entity integer counter — never the full
+    candidate set. Streams the candidate_pairs file in batches, merging
+    each batch against the true-pairs table (fast, C-level pandas merge)."""
+    gt_path = os.path.join(cache_dir, "train_ground_truth.parquet")
+    if not os.path.isfile(gt_path):
+        print("  [skip recall eval] train_ground_truth.parquet not found")
+        return
 
+    gt = pd.read_parquet(gt_path)
+    true_rows = []
+    true_counts = {}
+    for s1_id, matched in zip(gt["source1_entity_id"], gt["matched_entity_ids"]):
+        ids = set(x for x in matched.split(",") if x.strip()) if isinstance(matched, str) else set()
+        true_counts[s1_id] = len(ids)
+        for cid in ids:
+            true_rows.append((s1_id, cid))
+    del gt
 
-def build_features(cache_dir, split):
-    print(f"Building features for split={split}")
+    total_true = sum(true_counts.values())
+    entities_with_true_matches = sum(1 for c in true_counts.values() if c > 0)
+    true_pairs_df = pd.DataFrame(true_rows, columns=["source1_entity_id", "candidate_entity_id"])
+    del true_rows
+    print(f"  {len(true_pairs_df):,} true-match pairs to check against (this stays small in memory, "
+          f"unlike the full candidate set)")
 
-    pairs_path = os.path.join(cache_dir, f"{split}_candidate_pairs.parquet")
-    pairs_df = pd.read_parquet(pairs_path)
-    print(f"  loaded {len(pairs_df):,} candidate pairs")
+    found_counts = defaultdict(int)
+    pf = pq.ParquetFile(candidate_pairs_path)
+    rows_scanned = 0
+    for batch in pf.iter_batches(batch_size=batch_size):
+        chunk = batch.to_pandas()
+        rows_scanned += len(chunk)
+        hits = chunk.merge(true_pairs_df, on=["source1_entity_id", "candidate_entity_id"], how="inner")
+        for s1_id, cnt in hits["source1_entity_id"].value_counts().items():
+            found_counts[s1_id] += int(cnt)
+        del chunk, hits
+        print(f"    scanned {rows_scanned:,} rows ...", end="\r")
+    print(f"    scanned {rows_scanned:,} rows total" + " " * 20)
 
-    s1_df = load_source_lookup(cache_dir, split, 1)
-    s2_df = load_source_lookup(cache_dir, split, 2)
-    s3_df = load_source_lookup(cache_dir, split, 3)
+    total_found = sum(found_counts.values())
+    entities_full_recall = sum(
+        1 for s1_id, cnt in true_counts.items() if cnt > 0 and found_counts.get(s1_id, 0) >= cnt
+    )
 
-    df = attach_s1_fields(pairs_df, s1_df)
-    df = attach_candidate_fields(df, s2_df, s3_df)
-    df["s1_name_norm"] = df["s1_name_norm"].fillna("")
-    df["s1_addr_norm"] = df["s1_addr_norm"].fillna("")
-    df["cand_name_norm"] = df["cand_name_norm"].fillna("")
-    df["cand_addr_norm"] = df["cand_addr_norm"].fillna("")
-
-    print("  computing token-Jaccard features ...")
-    df["name_token_jaccard"] = [
-        _jaccard(a, b) for a, b in zip(df["s1_name_norm"], df["cand_name_norm"])
-    ]
-    df["addr_token_jaccard"] = [
-        _jaccard(a, b) for a, b in zip(df["s1_addr_norm"], df["cand_addr_norm"])
-    ]
-
-    print("  computing rapidfuzz features ...")
-    df["name_fuzz_ratio"] = [
-        fuzz.ratio(a, b) / 100.0 for a, b in zip(df["s1_name_norm"], df["cand_name_norm"])
-    ]
-    df["name_fuzz_token_sort_ratio"] = [
-        fuzz.token_sort_ratio(a, b) / 100.0 for a, b in zip(df["s1_name_norm"], df["cand_name_norm"])
-    ]
-    df["addr_fuzz_ratio"] = [
-        fuzz.ratio(a, b) / 100.0 for a, b in zip(df["s1_addr_norm"], df["cand_addr_norm"])
-    ]
-    df["addr_fuzz_token_sort_ratio"] = [
-        fuzz.token_sort_ratio(a, b) / 100.0 for a, b in zip(df["s1_addr_norm"], df["cand_addr_norm"])
-    ]
-
-    print("  fitting/loading TF-IDF vectorizers ...")
-    name_vec, addr_vec = fit_or_load_tfidf(cache_dir, split, s1_df, s2_df, s3_df)
-
-    print("  computing char n-gram TF-IDF cosine features ...")
-    df["name_chargram_tfidf_cosine"] = batched_pairwise_cosine(df, "s1_name_norm", "cand_name_norm", name_vec)
-    df["addr_chargram_tfidf_cosine"] = batched_pairwise_cosine(df, "s1_addr_norm", "cand_addr_norm", addr_vec)
-
-    print("  computing length / missingness features ...")
-    df["name_len_diff"] = (df["s1_name_norm"].str.len() - df["cand_name_norm"].str.len()).abs()
-    df["addr_len_diff"] = (df["s1_addr_norm"].str.len() - df["cand_addr_norm"].str.len()).abs()
-    df["addr_missing_s1"] = (df["s1_addr_norm"].str.len() == 0).astype(int)
-    df["addr_missing_cand"] = (df["cand_addr_norm"].str.len() == 0).astype(int)
-
-    if split == "train":
-        print("  attaching labels from ground truth ...")
-        gt_path = os.path.join(cache_dir, "train_ground_truth.parquet")
-        gt = pd.read_parquet(gt_path)
-        gt_dict = {}
-        for s1_id, matched in zip(gt["source1_entity_id"], gt["matched_entity_ids"]):
-            ids = set(x for x in matched.split(",") if x.strip()) if isinstance(matched, str) else set()
-            gt_dict[s1_id] = ids
-        df["label"] = [
-            1 if cid in gt_dict.get(s1_id, set()) else 0
-            for s1_id, cid in zip(df["source1_entity_id"], df["candidate_entity_id"])
-        ]
-        print(f"  label balance: {df['label'].sum():,} positive / {len(df) - df['label'].sum():,} negative")
-
-    feature_cols = [
-        "name_token_jaccard", "addr_token_jaccard",
-        "name_fuzz_ratio", "name_fuzz_token_sort_ratio",
-        "addr_fuzz_ratio", "addr_fuzz_token_sort_ratio",
-        "name_chargram_tfidf_cosine", "addr_chargram_tfidf_cosine",
-        "name_len_diff", "addr_len_diff",
-        "addr_missing_s1", "addr_missing_cand",
-    ]
-    keep_cols = ["source1_entity_id", "candidate_entity_id"] + feature_cols
-    if split == "train":
-        keep_cols.append("label")
-
-    out_df = df[keep_cols].copy()
-    out_path = os.path.join(cache_dir, f"{split}_features.parquet")
-    out_df.to_parquet(out_path, index=False)
-    print(f"  -> {out_path}  ({len(out_df):,} rows, {len(feature_cols)} features)")
-    return out_df
+    print("\n  BLOCKING RECALL (train):")
+    print(f"    micro recall (true matches captured): {total_found:,}/{total_true:,} = {100*total_found/max(1,total_true):.2f}%")
+    print(f"    entities with ALL true matches captured: {entities_full_recall:,}/{entities_with_true_matches:,} "
+          f"= {100*entities_full_recall/max(1,entities_with_true_matches):.2f}%")
+    print("    (this recall is the CEILING on your final F_0.5 recall — missed here can never be recovered by the model)")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Feature engineering for candidate pairs.")
+    parser = argparse.ArgumentParser(description="Blocking / candidate generation.")
     parser.add_argument("--cache-dir", default="cache")
     parser.add_argument("--split", choices=["train", "test"], required=True)
+    parser.add_argument("--max-block-size", type=int, default=2500,
+                         help="Drop a token's block entirely if it has more than this many entities (default: %(default)s)")
+    parser.add_argument("--max-candidates-per-entity", type=int, default=200,
+                         help="Cap on candidates kept per S1 entity, keeps the HIGHEST token-overlap ones "
+                              "when exceeded (default: %(default)s). LOWER this first if you hit MemoryError "
+                              "downstream in features.py — this number directly controls the total row count "
+                              "of candidate_pairs.parquet, which is what everything downstream has to process.")
+    parser.add_argument("--top-k-name-stopwords", type=int, default=150,
+                         help="Most-frequent NAME tokens to exclude as blocking keys, fit on train only (default: %(default)s)")
+    parser.add_argument("--top-k-addr-stopwords", type=int, default=80,
+                         help="Most-frequent ADDRESS tokens to exclude as blocking keys, fit on train only (default: %(default)s)")
+    parser.add_argument("--evaluate", action="store_true",
+                         help="After blocking, measure recall against train_ground_truth.parquet (train split only)")
     args = parser.parse_args()
-    build_features(args.cache_dir, args.split)
+
+    print(f"Blocking for split={args.split}")
+    fit_stopwords = (args.split == "train")
+    out_path, s1_df = run_blocking(
+        args.cache_dir, args.split,
+        max_block_size=args.max_block_size,
+        max_candidates_per_entity=args.max_candidates_per_entity,
+        fit_stopwords=fit_stopwords,
+        top_k_name=args.top_k_name_stopwords,
+        top_k_addr=args.top_k_addr_stopwords,
+    )
+
+    if args.evaluate:
+        if args.split != "train":
+            print("  --evaluate only works on --split train (no ground truth for test)")
+        else:
+            evaluate_recall(args.cache_dir, out_path)
 
 
 if __name__ == "__main__":

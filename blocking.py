@@ -160,7 +160,7 @@ def generate_candidates_streaming(s1_df, name_index, addr_index, name_stop, addr
     return total_pairs, n_entities_capped
 
 
-def run_blocking(cache_dir, split, max_block_size=5000, max_candidates_per_entity=800,
+def run_blocking(cache_dir, split, max_block_size=2500, max_candidates_per_entity=200,
                   fit_stopwords=False, top_k_name=150, top_k_addr=80):
     s1_path = os.path.join(cache_dir, f"{split}_source1_normalized.parquet")
     s2_path = os.path.join(cache_dir, f"{split}_source2_normalized.parquet")
@@ -228,36 +228,52 @@ def run_blocking(cache_dir, split, max_block_size=5000, max_candidates_per_entit
     return out_path, s1_df
 
 
-def evaluate_recall(cache_dir, candidate_pairs_path, batch_size=1_000_000):
+def evaluate_recall(cache_dir, candidate_pairs_path, batch_size=2_000_000):
+    """Memory-light recall check: instead of building a dict holding every
+    candidate ID for all 2.2M entities (which is what was running out of
+    memory), this only ever holds the much smaller TRUE-match pairs (a few
+    million rows) plus a per-entity integer counter — never the full
+    candidate set. Streams the candidate_pairs file in batches, merging
+    each batch against the true-pairs table (fast, C-level pandas merge)."""
     gt_path = os.path.join(cache_dir, "train_ground_truth.parquet")
     if not os.path.isfile(gt_path):
         print("  [skip recall eval] train_ground_truth.parquet not found")
         return
 
     gt = pd.read_parquet(gt_path)
-    gt_dict = {}
+    true_rows = []
+    true_counts = {}
     for s1_id, matched in zip(gt["source1_entity_id"], gt["matched_entity_ids"]):
         ids = set(x for x in matched.split(",") if x.strip()) if isinstance(matched, str) else set()
-        gt_dict[s1_id] = ids
+        true_counts[s1_id] = len(ids)
+        for cid in ids:
+            true_rows.append((s1_id, cid))
     del gt
 
-    cand_dict = defaultdict(set)
+    total_true = sum(true_counts.values())
+    entities_with_true_matches = sum(1 for c in true_counts.values() if c > 0)
+    true_pairs_df = pd.DataFrame(true_rows, columns=["source1_entity_id", "candidate_entity_id"])
+    del true_rows
+    print(f"  {len(true_pairs_df):,} true-match pairs to check against (this stays small in memory, "
+          f"unlike the full candidate set)")
+
+    found_counts = defaultdict(int)
     pf = pq.ParquetFile(candidate_pairs_path)
+    rows_scanned = 0
     for batch in pf.iter_batches(batch_size=batch_size):
         chunk = batch.to_pandas()
-        for s1_id, cid in zip(chunk["source1_entity_id"], chunk["candidate_entity_id"]):
-            cand_dict[s1_id].add(cid)
+        rows_scanned += len(chunk)
+        hits = chunk.merge(true_pairs_df, on=["source1_entity_id", "candidate_entity_id"], how="inner")
+        for s1_id, cnt in hits["source1_entity_id"].value_counts().items():
+            found_counts[s1_id] += int(cnt)
+        del chunk, hits
+        print(f"    scanned {rows_scanned:,} rows ...", end="\r")
+    print(f"    scanned {rows_scanned:,} rows total" + " " * 20)
 
-    total_true = total_found = entities_full_recall = entities_with_true_matches = 0
-    for s1_id, true_ids in gt_dict.items():
-        if not true_ids:
-            continue
-        entities_with_true_matches += 1
-        found = true_ids & cand_dict.get(s1_id, set())
-        total_true += len(true_ids)
-        total_found += len(found)
-        if len(found) == len(true_ids):
-            entities_full_recall += 1
+    total_found = sum(found_counts.values())
+    entities_full_recall = sum(
+        1 for s1_id, cnt in true_counts.items() if cnt > 0 and found_counts.get(s1_id, 0) >= cnt
+    )
 
     print("\n  BLOCKING RECALL (train):")
     print(f"    micro recall (true matches captured): {total_found:,}/{total_true:,} = {100*total_found/max(1,total_true):.2f}%")
@@ -270,10 +286,13 @@ def main():
     parser = argparse.ArgumentParser(description="Blocking / candidate generation.")
     parser.add_argument("--cache-dir", default="cache")
     parser.add_argument("--split", choices=["train", "test"], required=True)
-    parser.add_argument("--max-block-size", type=int, default=5000,
+    parser.add_argument("--max-block-size", type=int, default=2500,
                          help="Drop a token's block entirely if it has more than this many entities (default: %(default)s)")
-    parser.add_argument("--max-candidates-per-entity", type=int, default=800,
-                         help="Cap on candidates kept per S1 entity; keeps the HIGHEST token-overlap ones when exceeded (default: %(default)s)")
+    parser.add_argument("--max-candidates-per-entity", type=int, default=200,
+                         help="Cap on candidates kept per S1 entity, keeps the HIGHEST token-overlap ones "
+                              "when exceeded (default: %(default)s). LOWER this first if you hit MemoryError "
+                              "downstream in features.py — this number directly controls the total row count "
+                              "of candidate_pairs.parquet, which is what everything downstream has to process.")
     parser.add_argument("--top-k-name-stopwords", type=int, default=150,
                          help="Most-frequent NAME tokens to exclude as blocking keys, fit on train only (default: %(default)s)")
     parser.add_argument("--top-k-addr-stopwords", type=int, default=80,
